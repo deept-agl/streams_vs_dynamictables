@@ -1,0 +1,80 @@
+-- =====================================================================
+-- 04_new_batch_and_compare.sql
+-- New events arrive: some trips finish, new trips start, and one LATE event
+-- shows up out of order. Both pipelines must end up with the same answer.
+-- =====================================================================
+
+USE ROLE SYSADMIN;
+USE WAREHOUSE RIDES_WH;
+USE SCHEMA RIDES_DB.RAW;
+
+-- A. Finish every trip whose latest status is STARTED
+INSERT INTO TRIP_EVENTS (TRIP_ID, DRIVER_ID, CITY, STATUS, FARE, EVENT_TS)
+SELECT TRIP_ID, DRIVER_ID, CITY, 'COMPLETED',
+       UNIFORM(150, 900, RANDOM())::NUMBER(10,2),
+       DATEADD(MINUTE, 25, EVENT_TS)
+FROM TRIP_EVENTS
+QUALIFY ROW_NUMBER() OVER (PARTITION BY TRIP_ID ORDER BY EVENT_TS DESC) = 1
+    AND STATUS = 'STARTED';
+
+-- B. 50 brand-new trips, REQUESTED + STARTED in the same batch
+SET START_ID = (SELECT MAX(TRIP_ID) FROM TRIP_EVENTS);
+
+CREATE OR REPLACE TEMPORARY TABLE TMP_NEW AS
+SELECT $START_ID + ROW_NUMBER() OVER (ORDER BY SEQ4()) AS TRIP_ID,
+       UNIFORM(1, 20, RANDOM()) AS DRIVER_ID,
+       ARRAY_CONSTRUCT('Bengaluru','Mumbai','Delhi','Pune')[UNIFORM(0, 3, RANDOM())]::STRING AS CITY,
+       DATEADD(MINUTE, -UNIFORM(1, 30, RANDOM()), CURRENT_TIMESTAMP())::TIMESTAMP_NTZ AS TS
+FROM TABLE(GENERATOR(ROWCOUNT => 50));
+
+INSERT INTO TRIP_EVENTS (TRIP_ID, DRIVER_ID, CITY, STATUS, FARE, EVENT_TS)
+SELECT TRIP_ID, DRIVER_ID, CITY, 'REQUESTED', NULL, TS FROM TMP_NEW
+UNION ALL
+SELECT TRIP_ID, DRIVER_ID, CITY, 'STARTED', NULL, DATEADD(MINUTE, 5, TS) FROM TMP_NEW;
+
+-- C. A late, out-of-order event: an old STARTED for a trip that's already COMPLETED
+SET LATE_TRIP = (SELECT MIN(TRIP_ID) FROM TRIP_EVENTS WHERE STATUS = 'COMPLETED');
+
+INSERT INTO TRIP_EVENTS (TRIP_ID, DRIVER_ID, CITY, STATUS, FARE, EVENT_TS)
+SELECT TRIP_ID, DRIVER_ID, CITY, 'STARTED', NULL, DATEADD(MINUTE, -20, EVENT_TS)
+FROM TRIP_EVENTS
+WHERE TRIP_ID = $LATE_TRIP AND STATUS = 'COMPLETED';
+
+-- =====================================================================
+-- Run both pipelines now instead of waiting for the schedule
+-- =====================================================================
+EXECUTE TASK RIDES_DB.STREAMS_WAY.T_MERGE_TRIPS;          -- child task follows automatically
+ALTER DYNAMIC TABLE RIDES_DB.DT_WAY.DRIVER_DAILY_EARNINGS REFRESH;  -- refreshes upstream DT too
+
+-- Give the task ~30-60 s, then check its run:
+SELECT NAME, STATE, ERROR_MESSAGE, SCHEDULED_TIME, COMPLETED_TIME
+FROM TABLE(RIDES_DB.INFORMATION_SCHEMA.TASK_HISTORY(
+  SCHEDULED_TIME_RANGE_START => DATEADD(HOUR, -1, CURRENT_TIMESTAMP())))
+ORDER BY SCHEDULED_TIME DESC;
+
+-- Dynamic table refreshes: INCREMENTAL, how long, how many rows changed
+SELECT NAME, STATE, REFRESH_ACTION, REFRESH_TRIGGER,
+       DATEDIFF('second', REFRESH_START_TIME, REFRESH_END_TIME) AS DURATION_SEC
+FROM TABLE(RIDES_DB.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(NAME_PREFIX => 'RIDES_DB.DT_WAY'))
+ORDER BY REFRESH_START_TIME DESC
+LIMIT 10;
+
+-- =====================================================================
+-- Same answer?  Both directions must return 0 rows.
+-- =====================================================================
+SELECT * FROM RIDES_DB.STREAMS_WAY.TRIPS_CURRENT
+MINUS
+SELECT * FROM RIDES_DB.DT_WAY.TRIPS_CURRENT;
+
+SELECT * FROM RIDES_DB.DT_WAY.TRIPS_CURRENT
+MINUS
+SELECT * FROM RIDES_DB.STREAMS_WAY.TRIPS_CURRENT;
+
+SELECT * FROM RIDES_DB.STREAMS_WAY.DRIVER_DAILY_EARNINGS
+MINUS
+SELECT * FROM RIDES_DB.DT_WAY.DRIVER_DAILY_EARNINGS;
+
+-- The late trip is still COMPLETED in both:
+SELECT 'streams' AS PIPELINE, STATUS FROM RIDES_DB.STREAMS_WAY.TRIPS_CURRENT WHERE TRIP_ID = $LATE_TRIP
+UNION ALL
+SELECT 'dynamic', STATUS FROM RIDES_DB.DT_WAY.TRIPS_CURRENT WHERE TRIP_ID = $LATE_TRIP;
